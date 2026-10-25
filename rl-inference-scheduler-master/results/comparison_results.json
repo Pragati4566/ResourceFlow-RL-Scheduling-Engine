@@ -1,0 +1,42 @@
+{
+  "FIFO": {
+    "avg_latency": 21.850426537334492,
+    "p95_latency": 39.254999999999995,
+    "median_latency": 20.4,
+    "avg_ttft": 5.507621482725622,
+    "throughput": 0.18839999999999998,
+    "memory_violations": 0.0,
+    "gpu_utilization": 0.9803999999999998,
+    "dropped_jobs": 0.0
+  },
+  "SJF": {
+    "avg_latency": 20.573780627697168,
+    "p95_latency": 45.50999999999998,
+    "median_latency": 17.4,
+    "avg_ttft": 4.254883462951241,
+    "throughput": 0.1888,
+    "memory_violations": 0.0,
+    "gpu_utilization": 0.9815999999999999,
+    "dropped_jobs": 0.0
+  },
+  "Priority": {
+    "avg_latency": 21.74310320281054,
+    "p95_latency": 43.904999999999994,
+    "median_latency": 19.05,
+    "avg_ttft": 5.416384218938054,
+    "throughput": 0.18839999999999998,
+    "memory_violations": 0.0,
+    "gpu_utilization": 0.9799999999999999,
+    "dropped_jobs": 0.0
+  },
+  "DQN": {
+    "avg_latency": 21.119858778286286,
+    "p95_latency": 42.705,
+    "median_latency": 19.1,
+    "avg_ttft": 4.796656135819196,
+    "throughput": 0.1886,
+    "memory_violations": 0.0,
+    "gpu_utilization": 0.9818,
+    "dropped_jobs": 0.0
+  }
+}
