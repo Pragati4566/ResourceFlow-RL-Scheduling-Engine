@@ -1,420 +1,581 @@
-# rl-inference-scheduler
+# Adaptive Inference Scheduler
+### Reinforcement Learning for Resource-Aware LLM Inference Scheduling
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![CI](https://github.com/manishklach/rl-inference-scheduler/actions/workflows/test.yml/badge.svg)](https://github.com/manishklach/rl-inference-scheduler/actions/workflows/test.yml)
-[![Tests](https://img.shields.io/badge/tests-25%20passing-brightgreen.svg)](tests/)
+Adaptive Inference Scheduler is a simulation-driven reinforcement learning project that explores how intelligent scheduling policies can improve Large Language Model (LLM) inference serving under variable workloads and hardware constraints.
 
-Reinforcement learning for LLM inference scheduling. A simulated inference server receives variable-length requests with different priorities, TTFT SLOs, deadlines, and KV-cache memory requirements. RL agents (DQN, PPO) learn scheduling decisions that balance throughput, latency, SLO adherence, and memory pressure — competing against fixed heuristics (FIFO, SJF, Priority, LargestSafeBatch, MemAwarePriority).
+The simulator processes requests with different priorities, prompt lengths, completion lengths, deadlines, and Time to First Token (TTFT) Service Level Objectives (SLOs). It models prefill and decoding, GPU memory pressure, KV-cache growth, and batch efficiency.
 
-**Thesis**: Under realistic hardware constraints (prefill/decode phases, KV-cache memory growth, VRAM pressure, batch efficiency), RL can learn adaptive scheduling policies that outperform any single heuristic across mixed workloads and distribution shifts.
+The platform evaluates **Deep Q-Network (DQN) and Proximal Policy Optimization (PPO)** against conventional scheduling strategies, including First-In, First-Out (FIFO), Shortest Job First (SJF), priority-based scheduling, and memory-aware policies.
 
----
+The main objective is to understand the trade-offs among throughput, latency, deadline adherence, memory safety, and scheduling fairness across different workload conditions.
 
-## Table of Contents
+> **Current finding:** Reinforcement learning does not consistently outperform the strongest heuristic baselines in the current experiments. The project focuses on reproducible benchmarking and identifying the conditions under which adaptive scheduling may be useful.
 
-- [Quick Start](#quick-start)
-- [Architecture Overview](#architecture-overview)
-- [Simulation Model](#simulation-model)
-- [State & Action Spaces](#state--action-spaces)
-- [Workload Scenarios](#workload-scenarios)
-- [Benchmark Results](#benchmark-results)
-- [Project History](#project-history)
-  - [v0.1 — Basic Schedulers + DQN](#v01--basic-schedulers--dqn)
-  - [v0.2 — Hardware-Aware Simulator](#v02--hardware-aware-simulator)
-  - [v0.3 — Vectorized Rollout Engine & PPO](#v03--vectorized-rollout-engine--ppo)
-  - [v0.4 — Trace-Replay & RL-Wins Benchmark](#v04--trace-replay--rl-wins-benchmark)
-  - [v0.5 — LICENSE, CI, OOM Scenario, PPO Results](#v05--license-ci-oom-scenario-ppo-training-results)
-- [Limitations & Future Work](#limitations--future-work)
-- [Project Structure](#project-structure)
+## Key Features
 
----
-
-## Quick Start
-
-```bash
-pip install -r requirements.txt
-pytest tests/ -v                          # 26 tests, all pass
-
-# v0.2 — Compare all schedulers across 5 scenarios
-python -m experiments.compare_scenarios
-
-# v0.3 — Benchmark vectorized scaling (1→4096 envs)
-python -m experiments.benchmark_vectorized_env
-
-# v0.3 — Train PPO on vectorized environments
-python -m experiments.train_ppo_vectorized --num-envs 256 --epochs 50
-
-# v0.4 — Generate synthetic traces and evaluate
-python -m experiments.generate_traces --num-requests 10000
-python -m experiments.replay_trace --trace traces/adversarial_shift.csv --all-schedulers
-
-# v0.4 — Full RL-wins benchmark
-python -m experiments.rl_wins_benchmark
-
-# v0.5 — Mixed-curriculum PPO training (OOM-aware)
-python -m experiments.train_ppo_vectorized --scenario mixed_curriculum --num-envs 64 --epochs 100
-
-# v0.5 — Embedded plot viewing
-# See results/plots/p95_latency_by_scenario.png and deadline_miss_rate_by_scenario.png
-```
-
----
+- **Hardware-aware simulation:** Models prefill and decode phases, request completion, KV-cache memory growth, GPU memory pressure, and batching efficiency.
+- **Deep reinforcement learning:** Supports DQN and PPO agents for learning scheduling decisions.
+- **Multiple scheduling baselines:** Compares FIFO, SJF, priority-based scheduling, LargestSafeBatch, and MemAwarePriority.
+- **Vectorized environments:** Runs multiple simulated environments concurrently using tensor-based state representations.
+- **Workload simulation:** Evaluates normal traffic, burst traffic, memory pressure, high-priority requests, and adversarial workload changes.
+- **Trace-based evaluation:** Replays deterministic request traces to compare scheduling policies under consistent workloads.
+- **Distribution-shift testing:** Examines how policies behave when evaluation workloads differ from training scenarios.
+- **Performance benchmarking:** Measures latency, throughput, TTFT SLO violations, deadline misses, high-priority completion, and memory-related failures.
+- **Automated testing:** Covers simulator behavior, vectorized-environment equivalence, and trace-replay functionality.
+- **Experiment outputs:** Generates machine-readable benchmark results and plots for performance analysis.
 
 ## Architecture Overview
 
-**Two simulation paths, identical semantics:**
+The system contains two simulation paths with aligned scheduling behavior.
 
-```
-v0.2 (single-env reference)         v0.3+ (vectorized batch)
-────────────────────────────         ─────────────────────────
-HardwareAwareServer                  TensorizedBatchEnv
-  ├─ LLMJob objects                    ├─ Flat tensors [num_envs, ...]
-  ├─ Python list queue                 ├─ Fixed-size tensor queue
-  └─ Per-job prefill/decode            └─ Batched tensor ops
+### Reference Simulation
 
-Both share: 12 actions, 21-dim obs, reward function, scenario configs
-```
+The reference path models jobs using individual Python objects and processes requests through a hardware-aware server simulation.
 
-### v0.2 — Hardware-Aware Reference
+It handles:
+- Request arrivals and queue management.
+- Prefill and decode execution.
+- Compute-slot availability.
+- KV-cache allocation and memory pressure.
+- Scheduling decisions and reward calculation.
+- Job completion, deadline violations, and out-of-memory events.
 
-```
-    Scenario Config ──→ HardwareAwareServer ──→ V2Environment
-                             │                       │
-                    prefill/decode tick        21-dim obs
-                    KV-cache tracking          reward calc
-                    batch efficiency           done/info
-                    OOM detection
-```
+### Vectorized Simulation
 
-### v0.3 — Vectorized Batch Engine
+The vectorized path represents multiple environments using PyTorch tensors. It is designed to improve training throughput by processing batches of environments together rather than relying on separate Python job objects for every environment.
 
-```
-    BatchWorkload ──→ TensorizedBatchEnv ←── PPOAgent (ActorCritic)
-    (per-env RNG)        │                       │
-                  tensor step()              act(obs) → action
-                  [num_envs, ...]            [num_envs]
-                       │
-                  RolloutBuffer
-                  [steps, num_envs, 21]
-                       │
-                  GAE → PPO update
-```
+The training workflow consists of:
 
-### v0.4 — Trace Replay
+1. Generating simulated workloads.
+2. Collecting observations from parallel environments.
+3. Selecting actions using the scheduling policy.
+4. Recording rewards and state transitions.
+5. Calculating returns and advantages.
+6. Updating the PPO policy.
+7. Evaluating learned policies against fixed scheduling baselines.
 
-```
-    Trace CSV ──→ TraceReplayWorkload ──→ TensorizedBatchEnv
-    (deterministic)     │
-                  generate_arrivals(env_times)
-                  (same interface as BatchWorkload)
-```
+### Trace-Replay Workflow
 
----
+Generated request traces can be replayed deterministically through the scheduling environment. This allows different policies to be compared against the same arrival patterns and request characteristics.
 
 ## Simulation Model
 
-| Component | Detail |
+The environment uses discrete simulation ticks to represent the progress of inference requests.
+
+| Component | Model |
 |---|---|
-| **Time** | Discrete tick-based |
-| **Prefill** | `prefill_remaining -= prefill_speed × batch_efficiency` per tick |
-| **Decode** | `decode_remaining -= decode_speed × batch_efficiency` per tick |
-| **Batch efficiency** | {1: 1.0×, 2: 1.65×, 4: 2.80×, 8: 4.80×} per-job throughput |
-| **VRAM** | `active = model_base_memory(8GB) + Σ job.kv_cache_mb` |
-| **KV-cache** | `(prompt_len + generated_tokens) × 0.25 MB` per active job |
-| **Compute slots** | 4 concurrent |
-| **Defaults** | prefill_speed=5, decode_speed=10 (tokens/tick) |
+| Time progression | Discrete ticks |
+| Request execution | Prefill followed by decoding |
+| Compute capacity | Four concurrent execution slots |
+| Default prefill speed | 5 tokens per tick |
+| Default decode speed | 10 tokens per tick |
+| Base model memory | 8 GB |
+| KV-cache memory | 0.25 MB per prompt or generated token |
+| Observation space | 21-dimensional normalized vector |
+| Action space | 12 discrete scheduling actions |
 
-### Job Lifecycle
+### Prefill and Decoding
 
-```
-Arrived → Queued → Prefilling → Decoding → Completed
-                       │            │
-                  first_token     KV-cache grows
-                  TTFT SLO check  deadline check
-```
+During prefill, the simulator processes the input prompt. During decoding, it generates output tokens. Batch efficiency affects the rate at which active requests progress.
 
----
+The configured per-request batch-efficiency factors are:
 
-## State & Action Spaces
+| Batch size | Relative efficiency |
+|---:|---:|
+| 1 | 1.00× |
+| 2 | 1.65× |
+| 4 | 2.80× |
+| 8 | 4.80× |
 
-### Observation (21-dim, normalized [0,1])
+These are simulator parameters, not measurements of guaranteed real-world GPU performance.
 
-| Index | Feature | Index | Feature |
-|---|---|---|---|
-| 0 | Queue length | 10 | Oldest wait time |
-| 1 | Active job count | 11 | Avg wait time |
-| 2 | Free compute slots | 12 | Jobs near TTFT SLO |
-| 3 | VRAM used ratio | 13 | Jobs near deadline |
-| 4 | VRAM headroom | 14 | Short jobs (<300 tokens) |
-| 5 | Avg prompt length | 15 | Long-context jobs |
-| 6 | Max prompt length | 16 | GPU active flag |
-| 7 | Avg output length | 17 | Recent tokens / 20 |
-| 8 | Avg priority | 18 | Recent TTFT miss |
-| 9 | High-prio waiting | 19 | Recent deadline miss |
+### GPU Memory and KV Cache
 
-### Actions (12 discrete)
+Memory consumption is modeled using the base model footprint and the accumulated KV-cache requirements of active requests.
 
-| ID | Action | ID | Action |
-|---|---|---|---|
-| 0 | **Dispatch FIFO** | 6 | **Safe batch size 8** |
-| 1 | **Dispatch highest-priority** | 7 | **Reserve for high-prio** |
-| 2 | **Dispatch shortest-prefill** | 8 | **Wait** (no-op) |
-| 3 | **Dispatch shortest-total** | 9 | **Defer low-priority** |
-| 4 | **Safe batch size 2** | 10 | **Drop expired low-prio** |
-| 5 | **Safe batch size 4** | 11 | **Memory-protect dispatch** |
+The simulator tracks available VRAM, active requests, and memory pressure. Scheduling actions can protect memory headroom, defer requests, or prevent unsafe batching decisions.
 
-### Reward Function
+### Request Lifecycle
 
-| Component | Value | Why |
-|---|---|---|
-| Job completed | +2 (+3 if high-prio) | Throughput incentive |
-| Tokens generated | +0.05/token | Efficiency incentive |
-| TTFT SLO miss | -4 | Penalize slow first tokens |
-| Deadline miss | -6 | Penalize late completions |
-| OOM event | -10 | Avoid VRAM overflow |
-| Dropped job | -2 (-1 extra high-prio) | Penalize evictions |
-| Idle slot (queue non-empty) | -0.5/slot | Prevent GPU idling |
-| VRAM > 90% | -2 × (ratio-0.9)×10 | Progressive pressure |
-| Starvation (oldest >100 ticks) | -3 | Ensure fairness |
+A typical request follows these stages:
 
-Clipped to [-10, 10] for training stability.
+`Arrived → Queued → Prefilling → Decoding → Completed`
 
----
+The simulator also tracks first-token delivery, TTFT SLO violations, deadline misses, dropped jobs, starvation, and out-of-memory events.
+
+## State and Action Spaces
+
+### Observation Space
+
+The agent receives a normalized, 21-dimensional observation representing scheduling conditions.
+
+The observation includes information about:
+
+- Queue length and active jobs.
+- Available compute slots.
+- VRAM usage and remaining memory headroom.
+- Prompt and output-length characteristics.
+- Average and maximum waiting times.
+- Request priorities.
+- Requests approaching TTFT SLOs or deadlines.
+- Recent token generation activity.
+- Recent TTFT and deadline violations.
+- GPU activity and memory pressure.
+
+The observations provide the agent with information needed to balance immediate throughput against latency, priority, and resource-safety requirements.
+
+### Action Space
+
+The environment provides 12 discrete scheduling actions.
+
+| Action | Description |
+|---|---|
+| 0 | Dispatch FIFO |
+| 1 | Dispatch the highest-priority requests |
+| 2 | Dispatch by shortest prefill |
+| 3 | Dispatch by shortest total processing time |
+| 4 | Use a safe batch size of 2 |
+| 5 | Use a safe batch size of 4 |
+| 6 | Use a safe batch size of 8 |
+| 7 | Reserve capacity for high-priority requests |
+| 8 | Wait without dispatching |
+| 9 | Defer low-priority requests |
+| 10 | Drop expired low-priority requests |
+| 11 | Dispatch with memory protection |
+
+This discrete action space allows an agent to select among scheduling and batching strategies rather than directly controlling low-level hardware operations.
+
+## Reinforcement Learning
+
+### Deep Q-Network (DQN)
+
+The initial learning approach uses DQN to estimate the expected value of available scheduling actions.
+
+Its implementation includes:
+- An experience replay buffer.
+- A target network.
+- Epsilon-greedy action selection.
+- Reward-driven updates from simulated interactions.
+
+The initial experiments showed that DQN performed similarly to FIFO on the evaluated scenarios. This indicates that the initial training setup did not learn a sufficiently effective policy to surpass the stronger heuristic alternatives.
+
+### Proximal Policy Optimization (PPO)
+
+The PPO agent uses an actor-critic architecture to learn a policy and estimate state values.
+
+The implementation includes:
+- A shared two-layer neural network with 128 hidden units per layer.
+- Separate policy and value outputs.
+- PPO clipped policy updates.
+- Generalized Advantage Estimation (GAE).
+- A rollout buffer for parallel environment trajectories.
+- Minibatch-based training.
+- Configurable mixed-workload training.
+
+The documented training configuration uses a discount factor of 0.99, GAE parameter of 0.95, and PPO clipping parameter of 0.2.
+
+### Vectorized Rollout Engine
+
+The vectorized environment stores batched state representations in PyTorch tensors and supports training with multiple concurrent environments.
+
+The benchmark evaluates scaling from 1 to 4,096 environments. Throughput improves as the number of environments increases initially, but per-environment Python processing and other overhead eventually limit efficiency.
+
+The current implementation is most suitable for experimentation with hundreds of parallel environments rather than assuming that the largest batch is always fastest.
+
+## Reward Design
+
+The reward function encourages useful request completion while penalizing latency, resource failures, and poor scheduling decisions.
+
+| Event | Reward or penalty |
+|---|---:|
+| Completed request | +2 |
+| Completed high-priority request | +3 |
+| Generated token | +0.05 |
+| TTFT SLO violation | -4 |
+| Deadline violation | -6 |
+| Out-of-memory event | -10 |
+| Dropped request | -2 |
+| Additional penalty for dropping a high-priority request | -1 |
+| Idle compute slot while the queue is non-empty | -0.5 per slot |
+| VRAM usage above 90% | Progressive penalty |
+| Starvation when the oldest wait exceeds 100 ticks | -3 |
+
+Rewards are clipped to the interval [-10, 10] to support training stability.
+
+The reward structure makes scheduling a multi-objective problem: maximizing request throughput alone is insufficient if the resulting policy violates deadlines or creates memory failures.
 
 ## Workload Scenarios
 
-| Scenario | Arrival | Prompt | Priority | VRAM | Challenge |
-|---|---|---|---|---|---|
-| **normal_load** | Poisson 0.2 | 50-500 | Balanced | 16GB | Generic mixed workload |
-| **burst_load** | 0.05→0.5→0.2 | 50-400 | Normal | 16GB | Queue spikes under burst |
-| **memory_pressure** | Poisson 0.25 | 500-2000 | Normal | 10GB | OOM risk under load, fast prefill (50/s) + slow decode (2/s) |
-| **priority_pressure** | Poisson 0.2 | 50-500 | 50% high-priority | 16GB | Protect urgent TTFT SLOs |
-| **adversarial_long_short** | Phased (long→quiet→burst) | 800-2000 → 50-200 | Long: normal; Short: high | 16GB | Expose FIFO/SJF weakness |
+The simulator uses five primary workload configurations.
 
----
+| Scenario | Arrival pattern | Request characteristics | Main challenge |
+|---|---|---|---|
+| `normal_load` | Poisson arrivals at 0.2 | Mixed prompts of 50–500 tokens | General scheduling efficiency |
+| `burst_load` | Arrival rate increases from 0.05 to 0.5, then decreases to 0.2 | Prompts of 50–400 tokens | Queue spikes and backlog |
+| `memory_pressure` | Poisson arrivals at 0.25 | Prompts of 500–2,000 tokens; constrained VRAM | Memory safety and long-running requests |
+| `priority_pressure` | Poisson arrivals at 0.2 | 50% high-priority requests | Protecting urgent requests |
+| `adversarial_long_short` | Phased arrival pattern | Long jobs arrive before a burst of short, high-priority jobs | Starvation and shifting priorities |
+
+The workload configurations vary arrival patterns, request lengths, priorities, and memory limits so that scheduling strategies can be compared under different operating conditions.
+
+## Evaluation Metrics
+
+The benchmarking pipeline evaluates scheduling policies using several complementary metrics.
+
+- **Average latency:** Average time taken to process requests.
+- **P95/P99 latency:** Tail-latency measures that describe slower requests.
+- **TTFT SLO miss rate:** Proportion of requests that fail to meet their first-token service target.
+- **Deadline miss rate:** Proportion of requests that finish after their deadlines.
+- **Throughput:** Completed jobs per simulation tick.
+- **High-priority completion rate:** Proportion of high-priority jobs completed.
+- **Memory and OOM behavior:** Frequency of memory pressure and out-of-memory events.
+- **Starvation:** Whether requests wait excessively long for processing.
+
+Lower latency and violation rates are generally preferred, while throughput and successful completion rates should be higher. Results should be interpreted together because optimizing one metric can worsen another.
 
 ## Benchmark Results
 
-### v0.2 — Heuristic & DQN Comparison (5 scenarios × 5 seeds)
+### DQN Versus Heuristic Baselines
 
-**Avg latency** (lower is better)
+The initial benchmark compares five scheduling baselines and DQN across five scenarios and five random seeds.
 
-| Scenario | FIFO | SJF | Priority | LgSafeBatch | MemAwarePri | **DQN** |
-|---|---|---|---|---|---|---|
-| normal_load | 255.4 | **162.7** | 205.8 | 255.2 | 205.8 | 254.6 |
-| burst_load | 240.1 | **152.9** | 195.4 | 240.0 | 195.4 | 239.2 |
-| memory_pressure | 372.4 | **328.5** | 368.0 | 372.3 | 372.4 | 371.6 |
-| priority_pressure | 255.4 | **162.7** | 234.0 | 255.2 | 234.0 | 254.6 |
-| adversarial_long_short | 421.4 | **277.6** | 401.4 | 421.2 | 394.2 | 420.4 |
+#### Average latency
 
-**TTFT SLO miss rate** (lower is better)
+Lower is better.
 
-| Scenario | FIFO | SJF | Priority | LgSafeBatch | MemAwarePri | **DQN** |
-|---|---|---|---|---|---|---|
-| normal_load | 0.190 | 0.103 | **0.025** | 0.190 | **0.025** | 0.190 |
-| burst_load | 0.071 | 0.139 | **0.048** | 0.071 | **0.048** | 0.071 |
-| memory_pressure | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
-| priority_pressure | 0.190 | 0.103 | **0.041** | 0.190 | **0.041** | 0.190 |
-| adversarial_long_short | **0.000** | 0.419 | 0.183 | **0.000** | 0.183 | **0.000** |
+| Scenario | FIFO | SJF | Priority | LargestSafeBatch | MemAwarePriority | DQN |
+|---|---:|---:|---:|---:|---:|---:|
+| Normal load | 255.4 | **162.7** | 205.8 | 255.2 | 205.8 | 254.6 |
+| Burst load | 240.1 | **152.9** | 195.4 | 240.0 | 195.4 | 239.2 |
+| Memory pressure | 372.4 | **328.5** | 368.0 | 372.3 | 372.4 | 371.6 |
+| Priority pressure | 255.4 | **162.7** | 234.0 | 255.2 | 234.0 | 254.6 |
+| Adversarial long/short | 421.4 | **277.6** | 401.4 | 421.2 | 394.2 | 420.4 |
 
-**Deadline miss rate** (lower is better)
+SJF achieves the lowest average latency in these experiments.
 
-| Scenario | FIFO | SJF | Priority | LgSafeBatch | MemAwarePri | **DQN** |
-|---|---|---|---|---|---|---|
-| normal_load | 0.150 | **0.034** | 0.046 | 0.150 | 0.046 | 0.150 |
-| burst_load | 0.131 | 0.165 | **0.079** | 0.131 | **0.079** | 0.131 |
-| memory_pressure | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
-| priority_pressure | 0.150 | **0.034** | 0.036 | 0.150 | 0.036 | 0.150 |
-| adversarial_long_short | **0.000** | 0.481 | 0.183 | **0.000** | 0.233 | **0.000** |
+#### TTFT SLO miss rate
 
-**Throughput** (jobs/tick, higher is better)
+Lower is better.
 
-| Scenario | FIFO | SJF | Priority | LgSafeBatch | MemAwarePri | **DQN** |
-|---|---|---|---|---|---|---|
-| normal_load | 0.023 | **0.033** | 0.022 | 0.023 | 0.022 | 0.023 |
-| burst_load | 0.022 | **0.034** | 0.023 | 0.022 | 0.023 | 0.022 |
-| memory_pressure | 0.007 | **0.008** | 0.006 | 0.007 | 0.007 | 0.007 |
-| priority_pressure | 0.023 | **0.033** | 0.023 | 0.023 | 0.023 | 0.023 |
-| adversarial_long_short | 0.006 | **0.014** | 0.007 | 0.006 | 0.008 | 0.006 |
+| Scenario | FIFO | SJF | Priority | LargestSafeBatch | MemAwarePriority | DQN |
+|---|---:|---:|---:|---:|---:|---:|
+| Normal load | 0.190 | 0.103 | **0.025** | 0.190 | **0.025** | 0.190 |
+| Burst load | 0.071 | 0.139 | **0.048** | 0.071 | **0.048** | 0.071 |
+| Memory pressure | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| Priority pressure | 0.190 | 0.103 | **0.041** | 0.190 | **0.041** | 0.190 |
+| Adversarial long/short | **0.000** | 0.419 | 0.183 | **0.000** | 0.183 | **0.000** |
 
-**High-priority completion rate** (higher is better)
+Priority-aware policies achieve lower TTFT violation rates in several scenarios, although performance depends on the workload.
 
-| Scenario | FIFO | SJF | Priority | LgSafeBatch | MemAwarePri | **DQN** |
-|---|---|---|---|---|---|---|
-| normal_load | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
-| burst_load | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
-| memory_pressure | 0.750 | **1.000** | 0.750 | 0.750 | 0.750 | 0.750 |
-| priority_pressure | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
-| adversarial_long_short | 0.750 | **1.000** | **1.000** | 0.750 | **1.000** | 0.750 |
+#### Deadline miss rate
 
-### Key Findings
+Lower is better.
 
-1. **SJF dominates average latency and throughput** everywhere — shortest-job-first is hard to beat on raw efficiency.
+| Scenario | FIFO | SJF | Priority | LargestSafeBatch | MemAwarePriority | DQN |
+|---|---:|---:|---:|---:|---:|---:|
+| Normal load | 0.150 | **0.034** | 0.046 | 0.150 | 0.046 | 0.150 |
+| Burst load | 0.131 | 0.165 | **0.079** | 0.131 | **0.079** | 0.131 |
+| Memory pressure | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| Priority pressure | 0.150 | **0.034** | 0.036 | 0.150 | 0.036 | 0.150 |
+| Adversarial long/short | **0.000** | 0.481 | 0.183 | **0.000** | 0.233 | **0.000** |
 
-2. **Priority schedulers win on TTFT SLO miss rate** — they prioritize jobs, giving faster first-token times. MemAwarePriority matches Priority while adding memory safety.
+#### Throughput
 
-3. **SJF fails on adversarial_long_then_short** — 0.48 deadline miss rate, 0.42 TTFT SLO miss rate. When long jobs arrive first and short high-priority jobs flood in later, SJF starves the long jobs. FIFO has 0% miss rates (but terrible latency).
+Higher is better.
 
-4. **No scheduler is dominant** — each heuristic has blind spots. This is where RL can adapt.
+| Scenario | FIFO | SJF | Priority | LargestSafeBatch | MemAwarePriority | DQN |
+|---|---:|---:|---:|---:|---:|---:|
+| Normal load | 0.023 | **0.033** | 0.022 | 0.023 | 0.022 | 0.023 |
+| Burst load | 0.022 | **0.034** | 0.023 | 0.022 | 0.023 | 0.022 |
+| Memory pressure | 0.007 | **0.008** | 0.006 | 0.007 | 0.007 | 0.007 |
+| Priority pressure | 0.023 | **0.033** | 0.023 | 0.023 | 0.023 | 0.023 |
+| Adversarial long/short | 0.006 | **0.014** | 0.007 | 0.006 | 0.008 | 0.006 |
 
-5. **DQN currently matches FIFO** — 300 episodes isn't enough for 21-dim / 12-action space. PPO with vectorized rollout is the path forward.
+#### High-priority completion rate
 
-### v0.3 — Vectorized Environment Scaling (CPU)
+Higher is better.
 
+| Scenario | FIFO | SJF | Priority | LargestSafeBatch | MemAwarePriority | DQN |
+|---|---:|---:|---:|---:|---:|---:|
+| Normal load | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| Burst load | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| Memory pressure | 0.750 | **1.000** | 0.750 | 0.750 | 0.750 | 0.750 |
+| Priority pressure | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| Adversarial long/short | 0.750 | **1.000** | **1.000** | 0.750 | **1.000** | 0.750 |
+
+### Interpretation
+
+The initial evaluation highlights several findings:
+
+1. SJF performs strongly on average latency and throughput under the evaluated workload configurations.
+2. Priority-aware policies reduce TTFT violations in several scenarios.
+3. SJF can produce significant deadline misses when long jobs arrive before a burst of short, high-priority jobs.
+4. No single heuristic is best across every metric and workload.
+5. DQN, after the initial training budget, behaves similarly to FIFO and does not consistently beat the best heuristic.
+
+These observations motivate further experimentation with longer training, richer curricula, and more robust evaluation rather than assuming that reinforcement learning automatically improves scheduling.
+
+### Vectorized Environment Scaling
+
+The vectorized benchmark measures simulation throughput on CPU as the environment count increases.
+
+| Environments | Single-environment reference (s) | Vectorized execution (s) | Reported speedup | Environment steps/s |
+|---:|---:|---:|---:|---:|
+| 1 | 0.000395 | 0.002460 | 0.2× | 406 |
+| 4 | 0.000395 | 0.003955 | 0.4× | 1,011 |
+| 16 | 0.000395 | 0.010150 | 0.6× | 1,576 |
+| 64 | 0.000395 | 0.036953 | 0.7× | 1,732 |
+| 256 | 0.000395 | 0.130558 | 0.8× | 1,961 |
+| 1,024 | 0.000395 | 0.478172 | 0.8× | 2,141 |
+| 4,096 | 0.000395 | 2.403284 | 0.7× | 1,704 |
+
+The reported measurements indicate that throughput improves up to a point, but larger environment batches do not guarantee better efficiency. The Python loop used during action application is an identified bottleneck.
+
+### PPO Versus Heuristics on Trace-Based Workloads
+
+The later benchmark compares PPO with the heuristic baselines using generated request traces and a fixed seed.
+
+#### Throughput
+
+Higher is better.
+
+| Trace | FIFO | SJF | Priority | LargestSafeBatch | MemAwarePriority | PPO |
+|---|---:|---:|---:|---:|---:|---:|
+| Adversarial shift | 0.144 | **0.156** | 0.144 | 0.144 | 0.144 | 0.148 |
+| Burst traffic | 0.788 | 0.788 | 0.788 | 0.788 | 0.788 | 0.788 |
+| Interactive chat | 0.114 | 0.114 | 0.114 | 0.114 | 0.114 | 0.114 |
+| Long-context RAG | 0.052 | 0.052 | 0.052 | 0.052 | 0.052 | 0.052 |
+| Memory saturation | 0.092 | 0.092 | 0.092 | 0.092 | 0.092 | 0.092 |
+| Mixed priority | 0.457 | 0.457 | 0.450 | 0.457 | 0.457 | 0.453 |
+
+#### P95 latency
+
+Lower is better.
+
+| Trace | FIFO | SJF | Priority | LargestSafeBatch | MemAwarePriority | PPO |
+|---|---:|---:|---:|---:|---:|---:|
+| Adversarial shift | 271.1 | 271.1 | 271.1 | 271.1 | 271.1 | 271.1 |
+| Burst traffic | 141.7 | 141.7 | 141.7 | 141.7 | 141.7 | 141.7 |
+| Interactive chat | 53.9 | 53.9 | 53.9 | 53.9 | 53.9 | 53.9 |
+| Long-context RAG | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| Memory saturation | 273.7 | 273.7 | 273.7 | 273.7 | 273.7 | 273.7 |
+| Mixed priority | 199.8 | 199.8 | 200.2 | 199.8 | 199.8 | 200.0 |
+
+The reported deadline miss rate is zero across the schedulers and traces in this benchmark. That result is specific to these evaluated trace configurations.
+
+#### Key observations
+
+- On the adversarial-shift trace, SJF achieves the highest throughput, while PPO is second.
+- On several traces, all schedulers produce identical results, indicating limited differentiation under those simulator conditions.
+- The long-context RAG trace completes zero requests across all schedulers because its parameters exceed the simulator's capacity. Its zero latency values should therefore not be interpreted as successful performance.
+- PPO currently matches the strongest heuristic on some scenarios but does not consistently surpass it.
+- Training on a mixture of generated scenarios does not necessarily transfer to every trace distribution.
+
+The current benchmarks demonstrate why scenario design, metrics, capacity validation, and baseline comparisons are essential when evaluating learned scheduling policies.
+
+## Experiment Workflow
+
+The project supports several independent experiments.
+
+### 1. Compare Scheduling Strategies
+
+Runs the scheduling baselines and compares them across configured workloads.
+
+```bash
+python -m experiments.compare_scenarios
 ```
-Num envs | Single (s) | Vector (s) | Speedup | Env-steps/s
----------+------------+------------+---------+-------------
-       1 |   0.000395 |   0.002460 |    0.2x |         406
-       4 |   0.000395 |   0.003955 |    0.4x |        1011
-      16 |   0.000395 |   0.010150 |    0.6x |        1576
-      64 |   0.000395 |   0.036953 |    0.7x |        1732
-     256 |   0.000395 |   0.130558 |    0.8x |        1961
-    1024 |   0.000395 |   0.478172 |    0.8x |        2141
-    4096 |   0.000395 |   2.403284 |    0.7x |        1704
+
+### 2. Benchmark Vectorized Environments
+
+Measures simulation performance across different parallel-environment counts.
+
+```bash
+python -m experiments.benchmark_vectorized_env
 ```
 
-Peak efficiency at 512 envs (~2300 env-steps/s). Suitable for training at 256–1024 envs. The bottleneck is the per-env Python loop in `_apply_actions()`.
+### 3. Train PPO
 
-### v0.4 + v0.5 — Trace Benchmark: PPO vs Heuristics (seed=42)
+Trains the PPO policy with vectorized environments.
 
-**Throughput** (jobs/tick, higher is better)
+```bash
+python -m experiments.train_ppo_vectorized \
+    --num-envs 256 \
+    --epochs 50
+```
 
-| Trace | FIFO | SJF | Priority | LgSafeBatch | MemAwarePri | **PPO** |
-|---|---|---|---|---|---|---|
-| adversarial_shift | 0.144 | 0.156 | 0.144 | 0.144 | 0.144 | **0.148** |
-| burst_traffic | 0.788 | 0.788 | 0.788 | 0.788 | 0.788 | 0.788 |
-| interactive_chat | 0.114 | 0.114 | 0.114 | 0.114 | 0.114 | 0.114 |
-| long_context_rag | 0.052 | 0.052 | 0.052 | 0.052 | 0.052 | 0.052 |
-| memory_saturation | 0.092 | 0.092 | 0.092 | 0.092 | 0.092 | 0.092 |
-| mixed_priority | 0.457 | 0.457 | 0.450 | 0.457 | 0.457 | **0.453** |
+### 4. Generate Synthetic Traces
 
-**P95 Latency** (lower is better)
+```bash
+python -m experiments.generate_traces \
+    --num-requests 10000
+```
 
-| Trace | FIFO | SJF | Priority | LgSafeBatch | MemAwarePri | **PPO** |
-|---|---|---|---|---|---|---|
-| adversarial_shift | 271.1 | 271.1 | 271.1 | 271.1 | 271.1 | 271.1 |
-| burst_traffic | 141.7 | 141.7 | 141.7 | 141.7 | 141.7 | 141.7 |
-| interactive_chat | 53.9 | 53.9 | 53.9 | 53.9 | 53.9 | 53.9 |
-| long_context_rag | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
-| memory_saturation | 273.7 | 273.7 | 273.7 | 273.7 | 273.7 | 273.7 |
-| mixed_priority | 199.8 | 199.8 | 200.2 | 199.8 | 199.8 | 200.0 |
+### 5. Replay a Trace
 
-**Deadline miss rate** (lower is better): 0.0 across all schedulers and traces.
+```bash
+python -m experiments.replay_trace \
+    --trace traces/adversarial_shift.csv \
+    --all-schedulers
+```
 
-Key observations:
-- **adversarial_shift**: SJF has highest throughput (0.156); PPO second (0.148); all others 0.144
-- **burst_traffic, interactive_chat, long_context_rag, memory_saturation**: All schedulers identical — the VRAM guard prevents differentiation
-- **mixed_priority**: PPO matches FIFO/SJF/LgSafeBatch throughput
-- **long_context_rag**: 0 completed across ALL schedulers — trace parameters exceed simulator capacity
-- PPO matches the best heuristic on all traces but doesn't yet surpass. The mixed curriculum trains on 5 scenario workloads, which don't fully transfer to trace distributions.
+### 6. Run the RL Benchmark
 
-![P95 latency by scenario](results/plots/p95_latency_by_scenario.png)
-![Deadline miss rate by scenario](results/plots/deadline_miss_rate_by_scenario.png)
+```bash
+python -m experiments.rl_wins_benchmark
+```
 
----
+### 7. Train with the Mixed Workload Curriculum
 
-## Project History
+```bash
+python -m experiments.train_ppo_vectorized \
+    --scenario mixed_curriculum \
+    --num-envs 64 \
+    --epochs 100
+```
 
-### v0.1 — Basic Schedulers + DQN
+Training results can vary with random seeds, configuration, dependencies, and compute resources. Benchmark results should be regenerated when the implementation or experiment settings change.
 
-- Simple tick-based `InferenceServer` with 6 actions
-- FIFO, SJF, Priority baselines
-- DQN with replay buffer, target network, ε-greedy
-- Basic metrics: latency, throughput, queue length
+## Installation and Setup
 
-### v0.2 — Hardware-Aware Simulator
+### Requirements
 
-- **`HardwareAwareServer`**: prefill/decode phases, KV-cache tracking, VRAM pressure, batch efficiency (1×/1.65×/2.80×/4.80×)
-- **12 actions**: FIFO, Priority, SJF (prefill), SJF (total), batch sizes 2/4/8, reserve, wait, defer, drop expired, memory-protect
-- **21-dim observation** with normalized queue, VRAM, wait-time, and pressure features
-- **5 scenarios**: normal_load, burst_load, memory_pressure, priority_pressure, adversarial_long_then_short
-- **3 additional baselines**: `LargestSafeBatch`, `MemAwarePriority`, `RLScheduler`
-- **Full comparison pipeline**: `compare_scenarios.py` runs 5 schedulers × 5 scenarios × 5 seeds, outputs CSV + 6-panel plots
+- Python 3.11 or a compatible version.
+- pip.
+- Dependencies specified in `requirements.txt`.
+- A compatible PyTorch installation.
 
-### v0.3 — Vectorized Rollout Engine & PPO
+### Install Dependencies
 
-- **`TensorizedBatchEnv`**: all state as flat PyTorch tensors `[num_envs, ...]` — no Python `Job` objects
-- **256–4096 parallel environments** in a single `step()` call
-- **Per-env determinism**: each env has `random.Random(base_seed + env_id)`
-- **12 actions** dispatched via sentinel-masked `torch.argmin` / argsort
-- **PPO agent**: shared 2-layer MLP (21→128→128) + policy + value head, PPO-Clip (ε=0.2), GAE (λ=0.95, γ=0.99)
-- **`RolloutBuffer`**: stores `[steps, num_envs, 21]`, flattens for minibatch SGD
-- **6 equivalence tests**: verify v0.3 matches v0.2 single-env output
+Clone your repository and navigate to the project directory.
 
-### v0.4 — Trace-Replay & RL-Wins Benchmark
+```bash
+git clone YOUR_REPOSITORY_URL
+cd YOUR_REPOSITORY_DIRECTORY
+```
 
-- **`TraceReplayWorkload`**: CSV trace loader feeding deterministic request sequences into the vectorized env
-- **6 synthetic traces** (10k requests each): interactive_chat, burst_traffic, long_context_rag, mixed_priority, adversarial_shift, memory_saturation
-- **All schedulers on vectorized env**: heuristics use hardcoded action IDs, PPO uses learned policy — identical comparison
-- **Rich metrics**: p95/p99 latency/TTFT, high-priority p95 TTFT, deadline/TTFT miss rates, throughput, memory/OOM/starvation rates
-- **Mixed curriculum PPO training**: 6-phase schedule (normal_load → burst_load → priority_pressure → memory_pressure → adversarial_long_then_short → random mix)
-- **Distribution-shift evaluation**: train on 3 scenarios, test on 2 unseen + 6 traces
-- **25 tests total** (13 v0.1/v0.2 + 6 v0.3 + 6 v0.4)
+Create and activate a virtual environment.
 
-### v0.5 — LICENSE, CI, OOM Scenario, PPO Training Results
+**macOS/Linux**
 
-- **MIT License**, `requirements.txt` with version-pinned deps
-- **GitHub CI** workflow (`.github/workflows/test.yml`): runs `pytest tests/ -v` on push/PR to `master`
-- **CONTRIBUTING.md** with setup guide, test commands, and contribution workflow
-- **OOM gap addressed**: `memory_pressure` scenario tightened (`prefill_speed=50`, `decode_speed=2`, `output_len=200-1000`) so OOM events fire under load, giving the agent a learning signal for memory-protect actions
-- **PPO training** (100 epochs × 64 envs, mixed curriculum) completes with OOM events observed during `memory_pressure` phase (Reward: -81 to -90, O: 1-2/epoch)
-- **Trace benchmark (seed=42)**: PPO matches best heuristics across all 6 traces — ties on throughput, slightly edges FIFO on mixed_priority (136 vs 137 completed). See [Benchmark Results](#benchmark-results) for full tables.
-- **Real-trace usage documented**: README section explains how to plug in real vLLM/Ray Serve traces
-- **26 tests total** (25 existing + CI)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
----
+**Windows**
 
-## Limitations & Future Work
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
 
-| Limitation | Status / Plan |
-|---|---|---|
-| DQN matches FIFO, doesn't beat heuristics | ✅ PPO + vectorized rollout v0.3, trace-replay benchmark v0.4 |
-| OOM events never fired | ✅ Fixed in v0.5 — memory_pressure scenario tightened (prefill_speed=50, decode_speed=2) triggers OOM during decode |
-| PPO ties but doesn't beat heuristics | Mixed curriculum trains on 5 scenarios but trace-level PPO-vs-heuristic wins are marginal. Plan: longer training (200+ epochs), prioritized experience replay, adaptive curriculum |
-| Single-GPU simulation | Multi-GPU routing simulator |
-| CPU-only vectorized env | CUDA kernel optimizations |
-| Real vLLM / Ray Serve traces | CSV trace replay ready — plug in real traces |
+Install the required packages:
 
----
+```bash
+pip install -r requirements.txt
+```
+
+Run the automated tests:
+
+```bash
+pytest tests/ -v
+```
+
+Check the test results before relying on the project benchmarks.
 
 ## Project Structure
 
-```
+```text
 rl_inference_scheduler/
-├── job.py, simulator.py, environment.py    # v0.1
-├── dqn.py, trainer.py, metrics.py          # v0.1 DQN agent
-├── llm_job.py, llm_simulator.py            # v0.2 HardwareAwareServer
-├── llm_env.py, llm_trainer.py              # v0.2 V2Environment
-├── workload_batch.py                       # v0.3 BatchWorkload
-├── vectorized_env.py                       # v0.3 TensorizedBatchEnv
-├── rollout_buffer.py                       # v0.3 PPO buffer
-├── ppo.py                                  # v0.3 PPO agent
-├── trace_replay.py                         # v0.4 trace replay
-└── schedulers/                             # Baseline policies
-    ├── fifo.py, sjf.py, priority.py
-    ├── largest_safe_batch.py
-    └── memory_aware_priority.py
-
-experiments/
-├── run_baselines.py, compare.py            # v0.1
-├── train_rl.py                             # v0.1 + v0.2 (--v2)
-├── workloads.py                            # 5 scenario configs
-├── compare_scenarios.py                    # v0.2 multi-scenario benchmark
-├── train_ppo_vectorized.py                 # v0.3 PPO training (+ mixed_curriculum)
-├── benchmark_vectorized_env.py             # v0.3 scaling benchmark
-├── generate_traces.py                      # v0.4 trace generator
-├── replay_trace.py                         # v0.4 trace evaluation
-├── rl_wins_benchmark.py                    # v0.4 RL-wins comparison
-└── evaluate_shift.py                       # v0.4 distribution-shift
-
-tests/
-├── test_core.py                            # 13 tests (v0.1/v0.2)
-├── test_vectorized_equivalence.py          # 6 tests (v0.3)
-└── test_trace_replay.py                    # 6 tests (v0.4)
-
-traces/                                     # Generated synthetic traces
-├── interactive_chat.csv, burst_traffic.csv
-├── mixed_priority.csv, adversarial_shift.csv
-├── long_context_rag.csv, memory_saturation.csv
+├── job.py
+├── simulator.py
+├── environment.py
+├── dqn.py
+├── trainer.py
+├── metrics.py
+├── llm_job.py
+├── llm_simulator.py
+├── llm_env.py
+├── llm_trainer.py
+├── workload_batch.py
+├── vectorized_env.py
+├── rollout_buffer.py
+├── ppo.py
+├── trace_replay.py
+├── schedulers/
+│   ├── fifo.py
+│   ├── sjf.py
+│   ├── priority.py
+│   ├── largest_safe_batch.py
+│   └── memory_aware_priority.py
+├── experiments/
+│   ├── run_baselines.py
+│   ├── compare.py
+│   ├── train_rl.py
+│   ├── workloads.py
+│   ├── compare_scenarios.py
+│   ├── train_ppo_vectorized.py
+│   ├── benchmark_vectorized_env.py
+│   ├── generate_traces.py
+│   ├── replay_trace.py
+│   ├── rl_wins_benchmark.py
+│   └── evaluate_shift.py
+├── tests/
+│   ├── test_core.py
+│   ├── test_vectorized_equivalence.py
+│   └── test_trace_replay.py
+└── traces/
+    ├── interactive_chat.csv
+    ├── burst_traffic.csv
+    ├── mixed_priority.csv
+    ├── adversarial_shift.csv
+    ├── long_context_rag.csv
+    └── memory_saturation.csv
 ```
+
+## Testing and Quality Checks
+
+The test suite covers three broad areas:
+
+- **Core simulator tests:** Validate job execution, scheduling behavior, and environment logic.
+- **Vectorized equivalence tests:** Compare vectorized-environment behavior with the reference implementation.
+- **Trace-replay tests:** Check deterministic workload replay and policy evaluation.
+
+The project also includes a continuous-integration workflow that runs tests on repository updates.
+
+Passing tests helps validate expected behavior, but it does not guarantee that the agent has learned an effective policy or that simulation results will transfer to production inference systems.
+
+## Limitations
+
+The current implementation has several important limitations:
+
+- **RL performance:** DQN does not consistently outperform established heuristics, and PPO's improvements remain limited in the reported trace benchmarks.
+- **Simulation fidelity:** The workload and hardware model is simulated; real inference behavior may differ.
+- **Trace coverage:** Synthetic traces cannot capture every real-world request distribution.
+- **Capacity limitations:** Some long-context workloads exceed the current simulator's configured capacity.
+- **CPU execution:** The vectorized environment still has CPU-side bottlenecks.
+- **Single-system scope:** The current simulator does not implement multi-GPU scheduling.
+- **Generalization:** Training across selected scenarios does not guarantee performance under unseen distributions.
+
+## Future Improvements
+
+Potential improvements include:
+
+- Longer PPO training runs and improved learning-rate schedules.
+- More effective curriculum design and exploration strategies.
+- Evaluation over additional random seeds.
+- Expanded testing for workload shifts and out-of-memory conditions.
+- Reducing Python-loop overhead in action processing.
+- GPU-accelerated simulation.
+- Integration with real inference traces from serving systems.
+- Multi-GPU scheduling and resource coordination.
+- Stronger statistical comparisons between learned policies and heuristic baselines.
+- Improved trace validation to identify infeasible workloads before benchmarking.
+
+## Conclusion
+
+Adaptive Inference Scheduler provides an experimental framework for studying resource-aware scheduling through simulation and reinforcement learning.
+
+By combining hardware-aware request modeling, conventional scheduling strategies, DQN and PPO agents, vectorized training, and trace-based evaluation, it enables systematic analysis of the trade-offs between throughput, latency, service objectives, and memory safety.
+
+Its most important outcome is not the assumption that reinforcement learning always wins, but the ability to measure where learned policies perform well, where conventional heuristics remain stronger, and which limitations should guide the next experiment.
